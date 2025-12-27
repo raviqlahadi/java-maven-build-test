@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+repos/
+maven_cache/
+*.log
+*.json
