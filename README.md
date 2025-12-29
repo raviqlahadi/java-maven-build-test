@@ -59,6 +59,8 @@ Clone this repository and set up the virtual environment:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
+mkdir -p maven_cache
+chmod -R 777 maven_cache
 make setup
 
 ```
