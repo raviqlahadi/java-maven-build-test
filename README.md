@@ -36,6 +36,18 @@ This project automates the large-scale evaluation of Java Maven projects. It min
 - Python 3.12+
 - Make utility
 
+For a new WSL installation, ensure the following steps are completed:
+
+1. **System Tools**: Install essential Linux utilities:Bash
+    
+    `sudo apt update && sudo apt install -y python3-pip python3-venv make git curl`
+    
+2. **Docker Integration**:
+    - Install **Docker Desktop** on Windows.
+    - Go to `Settings > Resources > WSL Integration` and enable it for your distro.
+    - **Permission Fix**: Run `sudo usermod -aG docker $USER` and restart your terminal.
+3. **Storage**: If your C: drive is low on space, migrate your WSL distro to another drive (e.g., D:) using `wsl --export` and `wsl --import`.
+
 ---
 
 ## 📋 Getting Started

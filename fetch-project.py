@@ -14,7 +14,7 @@ def fetch_seart_projects(limit=200):
         "pomXmlPresent": "true",       # CRITICAL: Ensures it's a Maven project
         "isFork": "false",             # Avoid forks; original repos are more stable
         "starsMin": 50,                # Minimum quality bar
-        "committedMin": "2024-01-01",  # Active in the last year
+        "committedMin": "2025-06-01",  # Active in the last year
         "sort": "stargazers",
         "direction": "DESC",
         "page": 0
