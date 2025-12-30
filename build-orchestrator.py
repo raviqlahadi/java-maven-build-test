@@ -1,11 +1,18 @@
 import docker
 import os
 import json
+import shutil
+import glob
 
 # --- CONFIG ---
 REPOS_DIR = 'repos'
+ARTIFACTS_DIR = os.path.abspath("artifacts")
 M2_CACHE = os.path.abspath("maven_cache")
-REPORT_FILE = 'final_build_report.json'
+SUCCESS_FILE = 'success_projects.json'
+FAILED_FILE = 'failed_projects.json'
+
+# Ensure directories exist
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 if not os.path.exists(M2_CACHE): os.makedirs(M2_CACHE)
 
 CUR_UID = os.getuid()
@@ -27,25 +34,43 @@ def get_jdk_image(pom_path):
     except: pass
     return "maven:3.9.6-eclipse-temurin-17"
 
+def collect_jars(repo_path, folder_name):
+    """Finds .jar files in target folder and copies them to artifacts/"""
+    # Look for jars specifically in 'target' folders created by the build
+    jar_pattern = os.path.join(repo_path, "**/target/*.jar")
+    jars = glob.glob(jar_pattern, recursive=True)
+    count = 0
+    for jar in jars:
+        # Skip common non-runnable jars
+        if any(x in jar.lower() for x in ["sources", "javadoc", "original", "tests"]):
+            continue
+        
+        dest_name = f"{folder_name}_{os.path.basename(jar)}"
+        shutil.copy2(jar, os.path.join(ARTIFACTS_DIR, dest_name))
+        count += 1
+    return count
+
 def run_maven_build(client, pom_dir):
-    # Added -Duser.home=/tmp to bypass the /root permission error
-    maven_cmd = "mvn clean package -DskipTests -B -fae -Dcheckstyle.skip -Drat.skip -Duser.home=/tmp"
+    # -Dmaven.repo.local=/cache is the most stable way to handle shared volumes
+    maven_cmd = (
+        "mvn clean package -DskipTests -B -fae "
+        "-Dcheckstyle.skip -Drat.skip -Duser.home=/tmp "
+        "-Dmaven.repo.local=/cache"
+    )
     image = get_jdk_image(os.path.join(pom_dir, 'pom.xml'))
     
     container = None
     try:
-        # We manually manage removal to ensure logs are available
         container = client.containers.run(
             image=image,
             command=maven_cmd,
             user=f"{CUR_UID}:{CUR_GID}",
             volumes={
                 pom_dir: {'bind': '/app', 'mode': 'rw'},
-                M2_CACHE: {'bind': '/tmp/.m2', 'mode': 'rw'} # Use /tmp for writable cache mapping
+                M2_CACHE: {'bind': '/cache', 'mode': 'rw'}
             },
             working_dir='/app',
-            environment={"MAVEN_CONFIG": "/tmp/.m2"}, # Point config away from /root
-            detach=True # Run in background so we can wait and then get logs
+            detach=True
         )
         
         result = container.wait()
@@ -55,17 +80,15 @@ def run_maven_build(client, pom_dir):
             return True, "SUCCESS", image
         else:
             error_lines = [l for l in log_output.split('\n') if "[ERROR]" in l]
-            reason = " | ".join(error_lines[-2:]) if error_lines else "Build Failed (Check pom.xml)"
+            reason = " | ".join(error_lines[-2:]) if error_lines else "Build Failed"
             return False, reason, image
 
     except Exception as e:
         return False, str(e), image
     finally:
         if container:
-            try:
-                container.remove() # Manually cleanup
-            except:
-                pass
+            try: container.remove()
+            except: pass
 
 def main():
     try:
@@ -74,30 +97,52 @@ def main():
         print(f"❌ Docker connection failed: {e}")
         return
 
-    repo_folders = [d for d in os.listdir(REPOS_DIR) if os.path.isdir(os.path.join(REPOS_DIR, d))]
-    results = []
+    # Load existing state to avoid re-building successes
+    successes = json.load(open(SUCCESS_FILE)) if os.path.exists(SUCCESS_FILE) else []
+    failures = json.load(open(FAILED_FILE)) if os.path.exists(FAILED_FILE) else []
+    success_names = {p['name'] for p in successes}
 
-    print(f"🚀 Starting build for {len(repo_folders)} projects...")
+    repo_folders = [d for d in os.listdir(REPOS_DIR) if os.path.isdir(os.path.join(REPOS_DIR, d))]
+    
+    current_results = []
+    print(f"🚀 Processing {len(repo_folders)} folders...")
 
     for i, folder in enumerate(repo_folders, 1):
+        if folder in success_names:
+            print(f"[{i}/{len(repo_folders)}] ⏩ {folder}: Already in success list. Skipping.")
+            continue
+
         repo_path = os.path.abspath(os.path.join(REPOS_DIR, folder))
         pom_dir = find_pom_directory(repo_path)
         
         if not pom_dir:
             print(f"[{i}/{len(repo_folders)}] ⏩ {folder}: No pom.xml found.")
+            failures.append({"name": folder, "reason": "No pom.xml"})
             continue
 
         print(f"[{i}/{len(repo_folders)}] 📦 Building {folder}...", end=" ", flush=True)
         success, reason, image = run_maven_build(client, pom_dir)
         
-        print(f"{'✅' if success else '❌'} {reason}")
-        results.append({"project": folder, "success": success, "reason": reason})
+        if success:
+            jar_count = collect_jars(repo_path, folder)
+            print(f"✅ SUCCESS ({jar_count} jars collected)")
+            successes.append({"name": folder, "image": image})
+        else:
+            print(f"❌ {reason}")
+            # Add to temporary failures for this session, but check if already in global failures
+            failures.append({"name": folder, "reason": reason})
 
-    if results:
-        wins = len([r for r in results if r['success']])
-        print(f"\n🏁 Success Rate: {(wins/len(results))*100:.2f}%")
-        with open(REPORT_FILE, 'w') as f:
-            json.dump(results, f, indent=4)
+    # Save final states
+    with open(SUCCESS_FILE, 'w') as f:
+        json.dump(successes, f, indent=4)
+    
+    # Clean up failures list to remove duplicates before saving
+    unique_failures = {f['name']: f for f in failures}.values()
+    with open(FAILED_FILE, 'w') as f:
+        json.dump(list(unique_failures), f, indent=4)
+
+    print(f"\n🏁 Total Successes: {len(successes)}")
+    print(f"📦 Artifacts stored in: {ARTIFACTS_DIR}")
 
 if __name__ == "__main__":
     main()

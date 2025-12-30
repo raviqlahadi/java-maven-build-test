@@ -26,5 +26,20 @@ only-build: fetch clone build ## Run only the build phase assuming repos are rea
 
 clean: ## Remove cloned repos and temporary reports
 	sudo rm -rf repos/
+	sudo rm -rf maven_cache/
 	sudo rm -f projects.json final_build_report.json
 	@echo "Cleanup complete."
+
+# Run this repeatedly until success_projects.json hits 200
+iterate: fetch clone build
+	@echo "Cycle complete. Check success_projects.json count."
+
+# New cleanup that doesn't delete your "Gold" progress
+clean-failed:
+	rm -rf repos/
+	@echo "Deleted repo folders. Run 'make iterate' to download new candidates."
+
+# Run this to start the automatic loop
+auto: 
+	chmod +x auto_pilot.sh
+	./auto_pilot.sh
