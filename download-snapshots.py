@@ -128,14 +128,20 @@ def download_snapshots(json_file="projects.json"):
             stats["skipped_success"] += 1
             continue
 
-        print(f"[{i}/{len(projects)}] 🌐 {full_name}: resolving default branch...", end=" ", flush=True)
-        branch, meta = resolve_repo_meta(session, full_name)
-        if branch is None:
-            print(f"❌ {meta}")
-            failures.append({"name": full_name, "reason": meta})
-            stats["failed"] += 1
-            continue
-        print(f"branch={branch}")
+        # SEART gives us defaultBranch in projects.json — skip the GitHub API call
+        branch = p.get("default_branch")
+        meta = {}
+        if branch:
+            print(f"[{i}/{len(projects)}] 🌐 {full_name}: branch={branch} (from SEART)")
+        else:
+            print(f"[{i}/{len(projects)}] 🌐 {full_name}: resolving default branch...", end=" ", flush=True)
+            branch, meta = resolve_repo_meta(session, full_name)
+            if branch is None:
+                print(f"❌ {meta}")
+                failures.append({"name": full_name, "reason": meta})
+                stats["failed"] += 1
+                continue
+            print(f"branch={branch}")
 
         zip_url = f"{CODELOAD}/{full_name}/zip/refs/heads/{branch}"
         resp = github_request(session, zip_url)
@@ -150,7 +156,7 @@ def download_snapshots(json_file="projects.json"):
             extract_zipball(resp.content, target_path)
             manifest[full_name] = {
                 "branch": branch,
-                "stars": meta.get("stargazers_count"),
+                "stars": meta.get("stargazers") or p.get("stars"),
                 "size_kb": meta.get("size"),
                 "pushed_at": meta.get("pushed_at"),
                 "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

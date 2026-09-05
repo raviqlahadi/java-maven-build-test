@@ -213,3 +213,6 @@ artifacts/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+seart-ca-bundle.pem
+seart_cache/
+repos/*.tmp/
