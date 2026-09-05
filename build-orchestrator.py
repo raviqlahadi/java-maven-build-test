@@ -3,6 +3,8 @@ import os
 import json
 import shutil
 import glob
+import time
+import xml.etree.ElementTree as ET
 
 # --- CONFIG ---
 REPOS_DIR = 'repos'
@@ -10,6 +12,9 @@ ARTIFACTS_DIR = os.path.abspath("artifacts")
 M2_CACHE = os.path.abspath("maven_cache")
 SUCCESS_FILE = 'success_projects.json'
 FAILED_FILE = 'failed_projects.json'
+BUILD_TIMEOUT = 1200          # hard kill after 20 min (fixes infinite hangs)
+MEM_LIMIT = "2g"              # per-container memory cap
+NANO_CPUS = 2_000_000_000     # 2 CPU cores per container
 
 # Ensure directories exist
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
@@ -19,20 +24,59 @@ CUR_UID = os.getuid()
 CUR_GID = os.getgid()
 
 def find_pom_directory(root_path):
-    for root, dirs, files in os.walk(root_path):
+    """Return the shallowest pom.xml's dir. First-walk-hit can pick a
+    submodule pom in multi-module projects; shallowest = root candidate."""
+    candidates = []
+    for dirpath, dirnames, files in os.walk(root_path):
         if 'pom.xml' in files:
-            return os.path.abspath(root)
+            depth = dirpath[len(root_path):].count(os.sep)
+            candidates.append((depth, os.path.abspath(dirpath)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    return candidates[0][1]
+
+
+def _local(tag):
+    return tag.split('}')[-1]
+
+
+def parse_java_version(pom_path):
+    """Parse java version from pom properties via XML (replaces substring hack).
+    Checks maven.compiler.release/target/source and java.version properties."""
+    try:
+        tree = ET.parse(pom_path)
+    except ET.ParseError:
+        return None
+    props = {}
+    for el in tree.getroot():
+        if _local(el.tag) == 'properties':
+            for p in el:
+                props[_local(p.tag)] = (p.text or '').strip()
+    for key in ('maven.compiler.release', 'maven.compiler.target',
+                'maven.compiler.source', 'java.version'):
+        if props.get(key):
+            return props[key]
     return None
 
+
 def get_jdk_image(pom_path):
+    version = parse_java_version(pom_path)
+    if not version:
+        # POC default; research docs may change this — recorded for review
+        return "maven:3.9.6-eclipse-temurin-17"
     try:
-        with open(pom_path, 'r', errors='ignore') as f:
-            content = f.read()
-            if any(v in content for v in ['1.8', '8</java.version>', '1.7']):
-                return "maven:3.8.6-jdk-8"
-            if '11' in content: return "maven:3.9.6-eclipse-temurin-11"
-    except: pass
-    return "maven:3.9.6-eclipse-temurin-17"
+        major = (int(version.split('.')[1]) if version.startswith('1.')
+                 else int(version.split('.')[0]))
+    except (ValueError, IndexError):
+        return "maven:3.9.6-eclipse-temurin-17"
+    if major <= 8:
+        return "maven:3.8.6-jdk-8"
+    if major <= 11:
+        return "maven:3.9.6-eclipse-temurin-11"
+    if major <= 17:
+        return "maven:3.9.6-eclipse-temurin-17"
+    return "maven:3.9.6-eclipse-temurin-21"
 
 def collect_jars(repo_path, folder_name):
     """Finds .jar files in target folder and copies them to artifacts/"""
@@ -58,7 +102,7 @@ def run_maven_build(client, pom_dir):
         "-Dmaven.repo.local=/cache"
     )
     image = get_jdk_image(os.path.join(pom_dir, 'pom.xml'))
-    
+
     container = None
     try:
         container = client.containers.run(
@@ -70,13 +114,32 @@ def run_maven_build(client, pom_dir):
                 M2_CACHE: {'bind': '/cache', 'mode': 'rw'}
             },
             working_dir='/app',
+            mem_limit=MEM_LIMIT,
+            nano_cpus=NANO_CPUS,
             detach=True
         )
-        
-        result = container.wait()
+
+        # Poll with a deadline — container.wait() alone can hang forever
+        deadline = time.time() + BUILD_TIMEOUT
+        timed_out = False
+        while True:
+            container.reload()
+            if container.status in ('exited', 'dead'):
+                break
+            if time.time() > deadline:
+                timed_out = True
+                try: container.kill()
+                except Exception: pass
+                container.reload()
+                break
+            time.sleep(5)
+
+        exit_code = container.attrs.get('State', {}).get('ExitCode', 1)
         log_output = container.logs().decode('utf-8', errors='ignore')
-        
-        if result['StatusCode'] == 0:
+
+        if timed_out:
+            return False, "TIMEOUT: build exceeded hard kill limit", image
+        if exit_code == 0:
             return True, "SUCCESS", image
         else:
             error_lines = [l for l in log_output.split('\n') if "[ERROR]" in l]
@@ -89,6 +152,17 @@ def run_maven_build(client, pom_dir):
         if container:
             try: container.remove()
             except: pass
+
+
+def classify_failure(reason):
+    """Light error taxonomy — full categories pending research docs."""
+    r = reason.lower()
+    if "timeout" in r: return "timeout"
+    if "could not resolve" in r or "connection" in r or "network" in r: return "network"
+    if "no pom.xml" in r: return "no-pom"
+    if "could not find artifact" in r or "missing" in r: return "dependency"
+    if "cannot find symbol" in r or "compilation" in r or "incompatible" in r: return "compile"
+    return "other"
 
 def main():
     try:
@@ -117,12 +191,12 @@ def main():
         
         if not pom_dir:
             print(f"[{i}/{len(repo_folders)}] ⏩ {folder}: No pom.xml found.")
-            failures.append({"name": folder, "reason": "No pom.xml"})
+            failures.append({"name": folder, "reason": "No pom.xml", "category": "no-pom"})
             continue
 
         print(f"[{i}/{len(repo_folders)}] 📦 Building {folder}...", end=" ", flush=True)
         success, reason, image = run_maven_build(client, pom_dir)
-        
+
         if success:
             jar_count = collect_jars(repo_path, folder)
             print(f"✅ SUCCESS ({jar_count} jars collected)")
@@ -130,7 +204,8 @@ def main():
         else:
             print(f"❌ {reason}")
             # Add to temporary failures for this session, but check if already in global failures
-            failures.append({"name": folder, "reason": reason})
+            failures.append({"name": folder, "reason": reason,
+                             "category": classify_failure(reason)})
 
     # Save final states
     with open(SUCCESS_FILE, 'w') as f:

@@ -6,12 +6,8 @@ SUCCESS_FILE="success_projects.json"
 echo "🚀 Starting Auto-Pilot mode..."
 
 while true; do
-    # 1. Count current successes
-    if [ -f "$SUCCESS_FILE" ]; then
-        CURRENT_COUNT=$(grep -c "name" "$SUCCESS_FILE")
-    else
-        CURRENT_COUNT=0
-    fi
+    # 1. Count current successes (robust JSON count, not grep guesswork)
+    CURRENT_COUNT=$(python3 -c "import json; print(len(json.load(open('success_projects.json'))))" 2>/dev/null || echo 0)
 
     echo "📊 Progress: $CURRENT_COUNT / $TARGET"
 
