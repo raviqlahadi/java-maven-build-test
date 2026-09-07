@@ -113,6 +113,11 @@ def seart_get(session, url, **kwargs):
 
 # ------------------------------------------------------- strategy 1: bulk ---
 
+MAX_SIZE_KB = 300_000          # skip monsters (> ~300MB) — they eat build timeouts
+
+def _csv_true(value):
+    return str(value).strip().lower() in ("true", "1", "yes")
+
 def fetch_via_bulk(session):
     """Download the FULL filtered dataset in one request (official endpoint).
     Cached locally — later runs re-filter offline with zero API calls."""
@@ -134,8 +139,22 @@ def fetch_via_bulk(session):
         print(f"  ✅ cached {len(resp.content) / 1e6:.1f} MB gz")
 
     repos = []
+    skipped = {"fork": 0, "archived": 0, "size": 0}
     with gzip.open(cache_file, "rt", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
+            if _csv_true(row.get("isFork")):
+                skipped["fork"] += 1
+                continue
+            if _csv_true(row.get("isArchived")):
+                skipped["archived"] += 1
+                continue
+            try:
+                size_kb = int(row.get("size") or 0)
+            except ValueError:
+                size_kb = 0
+            if size_kb > MAX_SIZE_KB:
+                skipped["size"] += 1
+                continue
             try:
                 stars = int(row.get("stargazers") or 0)
             except ValueError:
@@ -146,6 +165,9 @@ def fetch_via_bulk(session):
                 "default_branch": row.get("defaultBranch") or "master",
                 "stars": stars,
             })
+    if any(skipped.values()):
+        print(f"  🧹 filtered out: {skipped['fork']} forks, "
+              f"{skipped['archived']} archived, {skipped['size']} oversize (>{MAX_SIZE_KB//1000}MB)")
     repos.sort(key=lambda r: r["stars"], reverse=True)
     return repos
 

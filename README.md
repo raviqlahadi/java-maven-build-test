@@ -26,8 +26,22 @@ This project automates the large-scale evaluation of Java Maven projects. It min
 
 - **Smart JDK Selection**
 
-    Automatically detects the required Java version by parsing `pom.xml`.
-    Currently maps **8, 11, 17** → `maven:3.9.x-eclipse-temurin-*` images. *(Known gap: projects targeting JDK 21+ fail with `invalid target release` — see Limitations.)*
+    Automatically detects the required Java version by parsing `pom.xml`
+    (properties *and* `maven-compiler-plugin` configuration).
+    Maps **8, 11, 17, 21** → `maven:3.9.x-eclipse-temurin-*` images; projects
+    demanding anything higher are skipped cheaply as `jdk-unsupported`.
+
+- **Root-pom Guard**
+
+    A repo without `pom.xml` at its **root** is skipped before any Docker
+    cycle is spent — nested poms belong to shipped sub-modules (this is how
+    Gradle-migrated repos used to slip through and waste a build).
+
+- **Timeout Retry on Warm Cache**
+
+    Timed-out builds are retried once at the end of the run — their
+    dependencies are already in `maven_cache`, so the retry is cheap and
+    frequently converts.
 
 - **Permission Mapping**
 
@@ -132,7 +146,8 @@ Each failure is categorized by `classify_failure()` (signal `[ERROR]` lines are 
 
 | Category | Trigger examples |
 | --- | --- |
-| `no-pom` | no `pom.xml` found (Gradle-migrated or docs repos) |
+| `no-pom` | no `pom.xml` at repo root (Gradle-migrated or docs repos) |
+| `jdk-unsupported` | pom demands a Java version beyond the image map (>21) |
 | `dependency` | `could not find artifact`, `(absent)`, `was not found in <repo>` |
 | `network` | `could not resolve` / `connection` / `network` errors |
 | `compile` | `compilation error`, `cannot find symbol`, `invalid target release: N` |
@@ -162,9 +177,10 @@ Each failure is categorized by `classify_failure()` (signal `[ERROR]` lines are 
 
 ## 🚧 Known Limitations
 
-- JDK image map covers 8/11/17 only — projects needing 21+ fail as `compile`.
-- 20-min hard kill is tight for mega-projects on a cold dependency cache.
-- `pomXmlPresent` sampling filter can admit repos whose *release tag* no longer ships Maven.
+- JDK image map covers 8/11/17/21 — projects needing newer JDKs (22+) are skipped as `jdk-unsupported` until the map grows.
+- Versions declared only in a *parent* pom (not the project's own) can't be pre-detected — they surface as `compile` failures at build time.
+- 20-min hard kill is tight for mega-projects on a cold dependency cache (mitigated by the warm-cache retry pass).
+- `pomXmlPresent` sampling filter can admit repos whose *release tag* no longer ships Maven (mitigated by the root-pom guard).
 - `auto_pilot.sh` references a `make iterate` target that does not exist in the Makefile (experimental script, not part of the core pipeline).
 
 ---

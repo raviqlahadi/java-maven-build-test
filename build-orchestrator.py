@@ -49,10 +49,11 @@ def parse_java_version(pom_path):
     Checks maven.compiler.release/target/source and java.version properties."""
     try:
         tree = ET.parse(pom_path)
-    except ET.ParseError:
+    except (ET.ParseError, OSError):
         return None
+    root = tree.getroot()
     props = {}
-    for el in tree.getroot():
+    for el in root:
         if _local(el.tag) == 'properties':
             for p in el:
                 props[_local(p.tag)] = (p.text or '').strip()
@@ -60,7 +61,40 @@ def parse_java_version(pom_path):
                 'maven.compiler.source', 'java.version'):
         if props.get(key):
             return props[key]
+    # maven-compiler-plugin <configuration><release|target|source> —
+    # projects like java-design-patterns declare 21 only there
+    for plugin in root.iter():
+        if _local(plugin.tag) != 'plugin':
+            continue
+        artifact_id = None
+        conf = None
+        for child in plugin:
+            tag = _local(child.tag)
+            if tag == 'artifactId':
+                artifact_id = (child.text or '').strip()
+            elif tag == 'configuration':
+                conf = child
+        if artifact_id != 'maven-compiler-plugin' or conf is None:
+            continue
+        for key in ('release', 'target', 'source'):
+            for child in conf:
+                if _local(child.tag) == key and (child.text or '').strip():
+                    text = child.text.strip()
+                    if text.replace('.', '').isdigit():
+                        return text
     return None
+
+
+def _major(version):
+    """'1.8' -> 8, '21' -> 21, garbage -> None."""
+    try:
+        return int(version.split('.')[1]) if version.startswith('1.') \
+            else int(version.split('.')[0])
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+MAX_MAPPED_JDK = 21  # keep in sync with get_jdk_image
 
 
 def get_jdk_image(pom_path):
@@ -68,10 +102,8 @@ def get_jdk_image(pom_path):
     if not version:
         # POC default; research docs may change this — recorded for review
         return "maven:3.9.6-eclipse-temurin-17"
-    try:
-        major = (int(version.split('.')[1]) if version.startswith('1.')
-                 else int(version.split('.')[0]))
-    except (ValueError, IndexError):
+    major = _major(version)
+    if major is None:
         return "maven:3.9.6-eclipse-temurin-17"
     if major <= 8:
         return "maven:3.8.6-jdk-8"
@@ -182,6 +214,7 @@ def classify_failure(reason):
     if "cannot find symbol" in r or "compilation" in r or "incompatible" in r: return "compile"
     # maven dialect: "Fatal error compiling: error: invalid target release: 21"
     if "invalid target release" in r or "fatal error compiling" in r: return "compile"
+    if "jdk-unsupported" in r or "no image mapped" in r: return "jdk-unsupported"
     return "other"
 
 def main():
@@ -207,15 +240,29 @@ def main():
             continue
 
         repo_path = os.path.abspath(os.path.join(REPOS_DIR, folder))
-        pom_dir = find_pom_directory(repo_path)
-        
-        if not pom_dir:
-            print(f"[{i}/{len(repo_folders)}] ⏩ {folder}: No pom.xml found.")
-            failures.append({"name": folder, "reason": "No pom.xml", "category": "no-pom"})
+
+        # Root-pom guard: no pom at repo ROOT means the project is not Maven
+        # at this ref (Gradle migration, docs repo). Nested poms belong to
+        # shipped sub-modules — don't build them. Saves a docker cycle.
+        if not os.path.exists(os.path.join(repo_path, 'pom.xml')):
+            print(f"[{i}/{len(repo_folders)}] ⏩ {folder}: No pom.xml at repo root.")
+            failures.append({"name": folder, "reason": "No pom.xml at repo root",
+                             "category": "no-pom"})
+            continue
+
+        # JDK pre-flight: don't spend a docker run on an unmappable compiler target
+        pom_path = os.path.join(repo_path, 'pom.xml')
+        required = _major(parse_java_version(pom_path) or '')
+        if required and required > MAX_MAPPED_JDK:
+            print(f"[{i}/{len(repo_folders)}] ⏩ {folder}: needs Java {required} "
+                  f"(map tops at {MAX_MAPPED_JDK}).")
+            failures.append({"name": folder,
+                             "reason": f"pom requires Java {required}, no image mapped (jdk-unsupported)",
+                             "category": "jdk-unsupported"})
             continue
 
         print(f"[{i}/{len(repo_folders)}] 📦 Building {folder}...", end=" ", flush=True)
-        success, reason, image = run_maven_build(client, pom_dir)
+        success, reason, image = run_maven_build(client, repo_path)
 
         if success:
             jar_count = collect_jars(repo_path, folder)
@@ -226,6 +273,27 @@ def main():
             # Add to temporary failures for this session, but check if already in global failures
             failures.append({"name": folder, "reason": reason,
                              "category": classify_failure(reason)})
+
+    # Timeout retry pass — deps of a timed-out build are now warm in maven_cache,
+    # so a single retry is cheap and frequently converts.
+    timeout_names = [f['name'] for f in failures if f.get('category') == 'timeout'
+                     and f['name'] not in success_names]
+    if timeout_names:
+        print(f"\n🔁 Retrying {len(timeout_names)} timeout(s) on warm cache...")
+        for folder in timeout_names:
+            repo_path = os.path.abspath(os.path.join(REPOS_DIR, folder))
+            print(f"🔁 {folder}...", end=" ", flush=True)
+            success, reason, image = run_maven_build(client, repo_path)
+            if success:
+                jar_count = collect_jars(repo_path, folder)
+                print(f"✅ SUCCESS on retry ({jar_count} jars)")
+                successes.append({"name": folder, "image": image})
+                failures = [f for f in failures if f['name'] != folder]
+            else:
+                print(f"❌ still failing: {reason}")
+                failures = [f for f in failures if f['name'] != folder]
+                failures.append({"name": folder, "reason": reason,
+                                 "category": classify_failure(reason)})
 
     # Save final states
     with open(SUCCESS_FILE, 'w') as f:
