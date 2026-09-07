@@ -134,7 +134,7 @@ def run_maven_build(client, pom_dir):
     maven_cmd = (
         "mvn clean package -DskipTests -B -fae "
         "-Dcheckstyle.skip -Drat.skip -Duser.home=/tmp "
-        "-Dmaven.repo.local=/cache"
+        "-Dmaven.repo.local=/cache -Ddocker.skip=true"
     )
     image = get_jdk_image(os.path.join(pom_dir, 'pom.xml'))
 
@@ -308,16 +308,17 @@ def main():
     print(f"📦 Artifacts stored in: {ARTIFACTS_DIR}")
 
     # Final report — Makefile contract: final_build_report.json
+    deduped_failures = list({f['name']: f for f in failures}.values())
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "totals": {
             "processed": len(repo_folders),
             "success": len(successes),
-            "failed": len(failures),
-            "by_category": dict(Counter(f.get("category", "other") for f in failures)),
+            "failed": len(deduped_failures),
+            "by_category": dict(Counter(f.get("category", "other") for f in deduped_failures)),
         },
         "successes": successes,
-        "failures": failures,
+        "failures": deduped_failures,
     }
     with open(REPORT_FILE, "w") as f:
         json.dump(report, f, indent=2)
