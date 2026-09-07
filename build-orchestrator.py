@@ -5,6 +5,7 @@ import json
 import shutil
 import glob
 import time
+from collections import Counter
 import xml.etree.ElementTree as ET
 
 # --- CONFIG ---
@@ -12,6 +13,7 @@ REPOS_DIR = 'repos'
 ARTIFACTS_DIR = os.path.abspath("artifacts")
 M2_CACHE = os.path.abspath("maven_cache")
 SUCCESS_FILE = 'success_projects.json'
+REPORT_FILE = 'final_build_report.json'
 FAILED_FILE = 'failed_projects.json'
 BUILD_TIMEOUT = 1200          # hard kill after 20 min (fixes infinite hangs)
 MEM_LIMIT = "2g"              # per-container memory cap
@@ -178,6 +180,8 @@ def classify_failure(reason):
     if "could not resolve" in r or "connection" in r or "network" in r: return "network"
     if "no pom.xml" in r: return "no-pom"
     if "cannot find symbol" in r or "compilation" in r or "incompatible" in r: return "compile"
+    # maven dialect: "Fatal error compiling: error: invalid target release: 21"
+    if "invalid target release" in r or "fatal error compiling" in r: return "compile"
     return "other"
 
 def main():
@@ -234,6 +238,22 @@ def main():
 
     print(f"\n🏁 Total Successes: {len(successes)}")
     print(f"📦 Artifacts stored in: {ARTIFACTS_DIR}")
+
+    # Final report — Makefile contract: final_build_report.json
+    report = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "totals": {
+            "processed": len(repo_folders),
+            "success": len(successes),
+            "failed": len(failures),
+            "by_category": dict(Counter(f.get("category", "other") for f in failures)),
+        },
+        "successes": successes,
+        "failures": failures,
+    }
+    with open(REPORT_FILE, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"📄 Report written: {REPORT_FILE}")
 
 if __name__ == "__main__":
     main()
