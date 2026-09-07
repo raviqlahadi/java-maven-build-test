@@ -1,5 +1,6 @@
 import docker
 import os
+import re
 import json
 import shutil
 import glob
@@ -142,8 +143,16 @@ def run_maven_build(client, pom_dir):
         if exit_code == 0:
             return True, "SUCCESS", image
         else:
-            error_lines = [l for l in log_output.split('\n') if "[ERROR]" in l]
-            reason = " | ".join(error_lines[-2:]) if error_lines else "Build Failed"
+            error_lines = [l.strip() for l in log_output.split('\n') if "[ERROR]" in l]
+            # Prefer signal lines over maven's footer boilerplate ("For more information...", "[Help 1]")
+            signal_re = re.compile(
+                r"could not (?:find artifact|resolve|transfer)|was not found in|\(absent\)|"
+                r"compilation error|cannot find symbol|no pom|failed to execute goal",
+                re.I,
+            )
+            signal_lines = [l for l in error_lines if signal_re.search(l)]
+            picked = signal_lines[-2:] if signal_lines else error_lines[-2:]
+            reason = " | ".join(picked) if picked else "Build Failed"
             return False, reason, image
 
     except Exception as e:
@@ -158,9 +167,16 @@ def classify_failure(reason):
     """Light error taxonomy — full categories pending research docs."""
     r = reason.lower()
     if "timeout" in r: return "timeout"
+    # dependency check BEFORE network: ghost-dep lines contain BOTH
+    # "could not resolve dependencies" and artifact-not-found markers —
+    # the more specific artifact-level signal wins.
+    # maven >=3.9 phrasing: "artifact ... was not found in <repo> ... (absent)"
+    # maven older phrasing: "could not find artifact X in <repo>"
+    if ("could not find artifact" in r or "(absent)" in r
+            or "was not found in" in r or "missing" in r):
+        return "dependency"
     if "could not resolve" in r or "connection" in r or "network" in r: return "network"
     if "no pom.xml" in r: return "no-pom"
-    if "could not find artifact" in r or "missing" in r: return "dependency"
     if "cannot find symbol" in r or "compilation" in r or "incompatible" in r: return "compile"
     return "other"
 
