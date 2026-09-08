@@ -44,14 +44,15 @@ def _local(tag):
     return tag.split('}')[-1]
 
 
-def parse_java_version(pom_path):
-    """Parse java version from pom properties via XML (replaces substring hack).
-    Checks maven.compiler.release/target/source and java.version properties."""
+def parse_java_version_text(pom_text):
+    """Parse java version from pom XML *text* (bytes or str). Checks
+    maven.compiler.release/target/source and java.version properties.
+    Text core shared with download-snapshots.py's pre-download gate —
+    one parser, no drift between cull and build pre-flight."""
     try:
-        tree = ET.parse(pom_path)
-    except (ET.ParseError, OSError):
+        root = ET.fromstring(pom_text)
+    except ET.ParseError:
         return None
-    root = tree.getroot()
     props = {}
     for el in root:
         if _local(el.tag) == 'properties':
@@ -83,6 +84,15 @@ def parse_java_version(pom_path):
                     if text.replace('.', '').isdigit():
                         return text
     return None
+
+
+def parse_java_version(pom_path):
+    """Path variant (build-phase use). Same logic as parse_java_version_text."""
+    try:
+        with open(pom_path, 'rb') as f:
+            return parse_java_version_text(f.read())
+    except OSError:
+        return None
 
 
 def _major(version):

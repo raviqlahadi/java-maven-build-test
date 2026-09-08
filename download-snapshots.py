@@ -8,17 +8,25 @@ Fixes over the POC:
 - Persistent manifest (download_manifest.json): records what was fetched.
 - Skips repos already in success_projects.json (fixes auto-pilot re-download bug).
 - Zipballs fetched from codeload.github.com directly, spaced SLEEP_BETWEEN apart.
+
+Phase A (repo-selection plan): pre-download gate. One CDN request per
+candidate fetches the root pom from raw.githubusercontent.com — no API rate
+limits, no token. Repos doomed before download are culled (pre-no-pom /
+pre-jdk-unsupported / pre-snapshot) at ~zero cost. CDN hiccups fail OPEN:
+an unknown candidate always proceeds to download.
 """
 import io
 import json
 import os
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 
 import requests
 
 GITHUB_API = "https://api.github.com"
 CODELOAD = "https://codeload.github.com"
+RAW_BASE = "https://raw.githubusercontent.com"
 REPOS_DIR = "repos"
 MANIFEST_FILE = "download_manifest.json"
 SUCCESS_FILE = "success_projects.json"
@@ -26,6 +34,8 @@ FAILURES_FILE = "download_failures.json"
 
 MAX_RETRIES = 5
 SLEEP_BETWEEN = 1.5          # polite spacing between downloads
+SLEEP_CULLED = 0.2           # token gesture after a pre-download cull
+RAW_TIMEOUT = 5              # CDN hiccup must never block a candidate
 UA = "java-maven-build-pipeline/2.0 (academic research)"
 
 
@@ -86,6 +96,106 @@ def resolve_repo_meta(session, full_name):
     return meta.get("default_branch", "master"), meta
 
 
+# --- Phase A: pre-download gate -------------------------------------------
+# One raw-CDN pom check before pulling gigabytes. raw.githubusercontent is
+# CDN-served: no GitHub API rate limits, no token, 5s timeout, fail-open.
+
+_ORCH = None
+
+
+def _orchestrator():
+    """Load build-orchestrator.py (dash in filename -> importlib) so the gate
+    and the build pre-flight share ONE java-version parser. No drift."""
+    global _ORCH
+    if _ORCH is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "build-orchestrator.py")
+        spec = importlib.util.spec_from_file_location("build_orchestrator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _ORCH = mod
+    return _ORCH
+
+
+def fetch_root_pom(session, full_name, branch):
+    """GET the root pom.xml via raw CDN. Returns (status, text) where status
+    is 'ok' (200), 'missing' (404 -> no root pom) or 'error' (hiccups).
+    Body returned as BYTES — ET.fromstring rejects str carrying an XML
+    encoding declaration (nearly every pom has one). Catches broadly: the
+    gate must never be the reason a download fails."""
+    url = f"{RAW_BASE}/{full_name}/{branch}/pom.xml"
+    try:
+        resp = session.get(url, timeout=RAW_TIMEOUT)
+        if resp.status_code == 200:
+            return "ok", resp.content
+        if resp.status_code == 404:
+            return "missing", None
+    except Exception:
+        pass
+    return "error", None
+
+
+def _first_child_text(el, name):
+    for c in el:
+        if c.tag.split('}')[-1] == name:
+            return (c.text or '').strip()
+    return None
+
+
+def pom_snapshot_risk(pom_text):
+    """True if the root pom's parent version ends in -SNAPSHOT (the
+    dbeaver/nacos kill class: unresolvable snapshot parents), or any
+    dependency version ends in -SNAPSHOT with a groupId DIFFERENT from the
+    project's own (external snapshots; same-group deps are reactor siblings
+    that resolve from the source tree)."""
+    try:
+        root = ET.fromstring(pom_text)
+    except ET.ParseError:
+        return False
+    own_group = None
+    for el in root:
+        tag = el.tag.split('}')[-1]
+        if tag == 'groupId':
+            own_group = (el.text or '').strip()
+        elif tag == 'parent':
+            ver = _first_child_text(el, 'version')
+            if ver and ver.endswith('-SNAPSHOT'):
+                return True
+    for dep in root.iter():
+        if dep.tag.split('}')[-1] != 'dependency':
+            continue
+        ver = _first_child_text(dep, 'version')
+        if not (ver and ver.endswith('-SNAPSHOT')):
+            continue
+        gid = _first_child_text(dep, 'groupId')
+        if gid and own_group and gid != own_group:
+            return True
+    return False
+
+
+def pre_download_gate(session, full_name, branch):
+    """Judge before downloading. Returns a cull reason ('pre-no-pom',
+    'pre-jdk-unsupported', 'pre-snapshot') or None to proceed.
+    Fails OPEN — an unknown candidate always reaches the build phase."""
+    status, pom_text = fetch_root_pom(session, full_name, branch)
+    if status == "missing":
+        return "pre-no-pom"
+    if status != "ok":
+        return None                       # unknown -> let the build judge
+    try:
+        orch = _orchestrator()
+        version = orch.parse_java_version_text(pom_text)
+        major = orch._major(version) if version else None
+        if major is not None and major > orch.MAX_MAPPED_JDK:
+            return "pre-jdk-unsupported"
+        if pom_snapshot_risk(pom_text):
+            return "pre-snapshot"
+    except Exception:
+        return None                       # parser surprise -> proceed
+    return None
+
+
 def extract_zipball(content, target_path):
     tmp = target_path + ".tmp"
     os.makedirs(tmp, exist_ok=True)
@@ -110,7 +220,8 @@ def download_snapshots(json_file="projects.json"):
     os.makedirs(REPOS_DIR, exist_ok=True)
     session = make_session()
 
-    stats = {"exists": 0, "skipped_success": 0, "downloaded": 0, "failed": 0}
+    stats = {"exists": 0, "skipped_success": 0, "downloaded": 0, "failed": 0,
+             "pre-no-pom": 0, "pre-jdk-unsupported": 0, "pre-snapshot": 0}
     failures = []
 
     for i, p in enumerate(projects, 1):
@@ -142,6 +253,15 @@ def download_snapshots(json_file="projects.json"):
                 stats["failed"] += 1
                 continue
             print(f"branch={branch}")
+
+        # --- Phase A gate: judge before pulling the ZIP (one CDN request) ---
+        gate_reason = pre_download_gate(session, full_name, branch)
+        if gate_reason:
+            print(f"  ✂️  {gate_reason} — culled before download")
+            failures.append({"name": full_name, "reason": gate_reason, "branch": branch})
+            stats[gate_reason] += 1
+            time.sleep(SLEEP_CULLED)
+            continue
 
         zip_url = f"{CODELOAD}/{full_name}/zip/refs/heads/{branch}"
         resp = github_request(session, zip_url)
@@ -177,6 +297,10 @@ def download_snapshots(json_file="projects.json"):
 
     print(f"\n🏁 downloaded={stats['downloaded']}  exists={stats['exists']}  "
           f"skipped(success)={stats['skipped_success']}  failed={stats['failed']}")
+    pre_culled = stats['pre-no-pom'] + stats['pre-jdk-unsupported'] + stats['pre-snapshot']
+    print(f"✂️  pre-download culled: {pre_culled} "
+          f"(no-pom={stats['pre-no-pom']}, jdk-unsupported={stats['pre-jdk-unsupported']}, "
+          f"snapshot={stats['pre-snapshot']})")
 
 
 if __name__ == "__main__":
