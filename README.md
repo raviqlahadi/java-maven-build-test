@@ -171,6 +171,12 @@ Each failure is categorized by `classify_failure()` (signal `[ERROR]` lines are 
 2. **JDK map needs 21+** — several modern projects demand it.
 3. **Mega-projects need bigger caps** — timeout/memory headroom, plus a warm `maven_cache` (second runs of the same project are dramatically faster).
 
+### The 50-repo march — 2026-09-07 (53 judged)
+
+- **13/24 attempted builds succeeded (54%)**, 476 jars; guards culled 31 candidates at zero Docker cost. Findings → the repo-selection plan: pre-download gate + CSV-level sampling.
+- **Phase A (2026-09-08): pre-download gate** — one raw-CDN pom check per candidate culls `no-pom` / `jdk-unsupported` / `SNAPSHOT` *before* any ZIP; fails open on CDN hiccups. Offline suite: `test-gate.py`.
+- **Phase B (2026-09-08): CSV-level sampling** — topic blocklist (android/kotlin/awesome/documentation + hyphen-prefix), `awesome`-name fallback, codeLines band 10k–400k, and stratified star bands 500★–20k★ (five buckets, round-robin, deterministic) replacing top-stars ordering. Offline suite: `test-sampling.py`. From 116,944 indexed repos, the window holds **2,774 buildable-looking candidates** (bands: 1191/730/551/185/57).
+
 *Historical v1 evaluation: 39% success rate over 200 projects (superseded by v2 architecture).*
 
 ---
