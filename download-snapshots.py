@@ -83,6 +83,35 @@ def github_request(session, url, stream=False, max_retries=MAX_RETRIES):
     return resp  # exhausted retries — caller treats as failure
 
 
+def resolve_release_tag(session, full_name):
+    """Phase C: latest release tag via one authed API call (the research
+    brief's own advice: 'check out the latest release — more likely to
+    build'). Returns the tag, or None (no token / no releases / API
+    trouble) — caller falls back to the default branch. 404 means the repo
+    publishes no releases; that's a normal outcome, not an error. Without
+    GITHUB_TOKEN we don't even ask: the 60/hr anonymous budget stays for
+    branch resolution only."""
+    if not session.headers.get("Authorization"):
+        return None
+    resp = github_request(session, f"{GITHUB_API}/repos/{full_name}/releases/latest")
+    if resp is None or resp.status_code != 200:
+        return None
+    return (resp.json() or {}).get("tag_name") or None
+
+
+def fetch_zipball(session, full_name, tag, branch):
+    """ZIP for the chosen ref; a missing tag ZIP falls back to the branch.
+    Returns (resp, ref, ref_kind)."""
+    if tag:
+        resp = github_request(session, f"{CODELOAD}/{full_name}/zip/refs/tags/{tag}")
+        if resp is not None and resp.status_code == 200:
+            return resp, tag, "release-tag"
+        print(f"  ⚠️  tag ZIP unavailable ({getattr(resp, 'status_code', 'no-resp')})"
+              f" — falling back to branch {branch}")
+    resp = github_request(session, f"{CODELOAD}/{full_name}/zip/refs/heads/{branch}")
+    return resp, branch, "branch"
+
+
 def resolve_repo_meta(session, full_name):
     """Returns (default_branch, meta_dict) or (None, error_reason)."""
     resp = github_request(session, f"{GITHUB_API}/repos/{full_name}")
@@ -118,13 +147,14 @@ def _orchestrator():
     return _ORCH
 
 
-def fetch_root_pom(session, full_name, branch):
-    """GET the root pom.xml via raw CDN. Returns (status, text) where status
-    is 'ok' (200), 'missing' (404 -> no root pom) or 'error' (hiccups).
-    Body returned as BYTES — ET.fromstring rejects str carrying an XML
-    encoding declaration (nearly every pom has one). Catches broadly: the
-    gate must never be the reason a download fails."""
-    url = f"{RAW_BASE}/{full_name}/{branch}/pom.xml"
+def fetch_root_pom(session, full_name, ref):
+    """GET the root pom.xml via raw CDN for any ref (branch or tag). Returns
+    (status, text) where status is 'ok' (200), 'missing' (404 -> no root
+    pom) or 'error' (hiccups). Body returned as BYTES — ET.fromstring
+    rejects str carrying an XML encoding declaration (nearly every pom has
+    one). Catches broadly: the gate must never be the reason a download
+    fails."""
+    url = f"{RAW_BASE}/{full_name}/{ref}/pom.xml"
     try:
         resp = session.get(url, timeout=RAW_TIMEOUT)
         if resp.status_code == 200:
@@ -174,11 +204,12 @@ def pom_snapshot_risk(pom_text):
     return False
 
 
-def pre_download_gate(session, full_name, branch):
-    """Judge before downloading. Returns a cull reason ('pre-no-pom',
-    'pre-jdk-unsupported', 'pre-snapshot') or None to proceed.
-    Fails OPEN — an unknown candidate always reaches the build phase."""
-    status, pom_text = fetch_root_pom(session, full_name, branch)
+def pre_download_gate(session, full_name, ref):
+    """Judge before downloading (branch or tag ref). Returns a cull reason
+    ('pre-no-pom', 'pre-jdk-unsupported', 'pre-snapshot') or None to
+    proceed. Fails OPEN — an unknown candidate always reaches the build
+    phase."""
+    status, pom_text = fetch_root_pom(session, full_name, ref)
     if status == "missing":
         return "pre-no-pom"
     if status != "ok":
@@ -221,7 +252,8 @@ def download_snapshots(json_file="projects.json"):
     session = make_session()
 
     stats = {"exists": 0, "skipped_success": 0, "downloaded": 0, "failed": 0,
-             "pre-no-pom": 0, "pre-jdk-unsupported": 0, "pre-snapshot": 0}
+             "pre-no-pom": 0, "pre-jdk-unsupported": 0, "pre-snapshot": 0,
+             "release-tag": 0, "branch": 0}
     failures = []
 
     for i, p in enumerate(projects, 1):
@@ -254,21 +286,29 @@ def download_snapshots(json_file="projects.json"):
                 continue
             print(f"branch={branch}")
 
-        # --- Phase A gate: judge before pulling the ZIP (one CDN request) ---
-        gate_reason = pre_download_gate(session, full_name, branch)
+        # --- Phase C: prefer the latest release tag (stable, post-CI code) ---
+        tag = resolve_release_tag(session, full_name)
+        if tag:
+            print(f"[{i}/{len(projects)}] 🏷️  {full_name}: release {tag}")
+
+        # --- Phase A gate: judge before pulling the ZIP (one CDN request).
+        # The gate reads the ref we will actually build (tag if any). ---
+        gate_reason = pre_download_gate(session, full_name, tag or branch)
         if gate_reason:
             print(f"  ✂️  {gate_reason} — culled before download")
-            failures.append({"name": full_name, "reason": gate_reason, "branch": branch})
+            failures.append({"name": full_name, "reason": gate_reason,
+                             "branch": branch, "ref": tag or branch,
+                             "ref_kind": "release-tag" if tag else "branch"})
             stats[gate_reason] += 1
             time.sleep(SLEEP_CULLED)
             continue
 
-        zip_url = f"{CODELOAD}/{full_name}/zip/refs/heads/{branch}"
-        resp = github_request(session, zip_url)
+        resp, ref, ref_kind = fetch_zipball(session, full_name, tag, branch)
         if resp is None or resp.status_code != 200:
             reason = f"zip-{resp.status_code if resp is not None else 'no-resp'}"
             print(f"  ❌ {reason}")
-            failures.append({"name": full_name, "reason": reason, "branch": branch})
+            failures.append({"name": full_name, "reason": reason, "branch": branch,
+                             "ref": ref, "ref_kind": ref_kind})
             stats["failed"] += 1
             continue
 
@@ -276,6 +316,8 @@ def download_snapshots(json_file="projects.json"):
             extract_zipball(resp.content, target_path)
             manifest[full_name] = {
                 "branch": branch,
+                "ref": ref,
+                "ref_kind": ref_kind,
                 "stars": meta.get("stargazers") or p.get("stars"),
                 "size_kb": meta.get("size"),
                 "pushed_at": meta.get("pushed_at"),
@@ -283,8 +325,9 @@ def download_snapshots(json_file="projects.json"):
             }
             with open(MANIFEST_FILE, "w") as f:
                 json.dump(manifest, f, indent=2)
-            print(f"  ✅ extracted to {target_path}")
+            print(f"  ✅ extracted to {target_path} ({ref_kind})")
             stats["downloaded"] += 1
+            stats[ref_kind] += 1
         except Exception as e:
             print(f"  ❌ {e}")
             failures.append({"name": full_name, "reason": str(e)})
@@ -296,7 +339,8 @@ def download_snapshots(json_file="projects.json"):
         json.dump(failures, f, indent=2)
 
     print(f"\n🏁 downloaded={stats['downloaded']}  exists={stats['exists']}  "
-          f"skipped(success)={stats['skipped_success']}  failed={stats['failed']}")
+          f"skipped(success)={stats['skipped_success']}  failed={stats['failed']}  "
+          f"[release-tag={stats['release-tag']}, branch={stats['branch']}]")
     pre_culled = stats['pre-no-pom'] + stats['pre-jdk-unsupported'] + stats['pre-snapshot']
     print(f"✂️  pre-download culled: {pre_culled} "
           f"(no-pom={stats['pre-no-pom']}, jdk-unsupported={stats['pre-jdk-unsupported']}, "
